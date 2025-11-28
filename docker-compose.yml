@@ -1,0 +1,314 @@
+version: '3.8'
+
+# ================== COMMON AIRFLOW SETTINGS ==================
+x-airflow-build: &airflow-build
+  context: .
+  dockerfile: Dockerfile.airflow
+
+x-airflow-common: &airflow-common
+  image: airflow-custom:latest
+  build: *airflow-build
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: ${AIRFLOW_EXECUTOR:-LocalExecutor}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow_webserver:8080/execution/ 
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@airflow_db:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@airflow_db:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__WEBSERVER__SECRET_KEY: "my_super_secret_long_random_key_123"
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+    AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./config:/opt/airflow/config
+    - ./data:/opt/airflow/data
+    - ./requirements.txt:/opt/airflow/requirements.txt
+  # có thể bật dòng user nếu muốn fix UID, còn không thì cứ để comment cho đỡ lỗi
+  # user: "${AIRFLOW_UID:-50000}:0"
+
+services:
+  # ================= AIRFLOW =================
+
+  airflow_db:
+    image: postgres:16.0
+    container_name: airflow_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
+      POSTGRES_DB: ${POSTGRES_DB:-airflow}
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-airflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  airflow_init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create \
+          --role Admin \
+          --username ${_AIRFLOW_WWW_USER_USERNAME:-admin} \
+          --password ${_AIRFLOW_WWW_USER_PASSWORD:-admin} \
+          --firstname ${_AIRFLOW_WWW_USER_FIRSTNAME:-Admin} \
+          --lastname ${_AIRFLOW_WWW_USER_LASTNAME:-User} \
+          --email ${_AIRFLOW_WWW_USER_EMAIL:-admin@example.com} || true
+        echo ">>> airflow_init finished"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-admin}
+      _AIRFLOW_WWW_USER_EMAIL: ${_AIRFLOW_WWW_USER_EMAIL:-admin@example.com}
+      _AIRFLOW_WWW_USER_FIRSTNAME: ${_AIRFLOW_WWW_USER_FIRSTNAME:-Admin}
+      _AIRFLOW_WWW_USER_LASTNAME: ${_AIRFLOW_WWW_USER_LASTNAME:-User}
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+    restart: "no"
+
+  airflow_webserver:
+    <<: *airflow-common
+    container_name: airflow_webserver
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+      airflow_init:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-common-env
+    command: >
+      bash -c "
+        pip install --no-cache-dir -r /opt/airflow/requirements.txt &&
+        exec airflow api-server"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+
+  airflow_scheduler:
+    <<: *airflow-common
+    container_name: airflow_scheduler
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+      airflow_init:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-common-env
+    command: scheduler
+    restart: always
+
+  airflow_dag_processor:
+    <<: *airflow-common
+    container_name: airflow_dag_processor
+    depends_on:
+      airflow_db:
+        condition: service_healthy
+      airflow_init:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-common-env
+    command: dag-processor
+    restart: always
+
+  # ================= KAFKA / ZOOKEEPER =================
+
+  kafka_zookeeper:
+    image: confluentinc/cp-zookeeper:6.2.1
+    container_name: kafka_zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - kafka_network
+      - default
+
+  kafka_base:
+    image: confluentinc/cp-kafka:6.2.1
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: kafka_zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,DOCKER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_LOG4J_LOGGERS: "kafka.controller=INFO,kafka.producer.async.DefaultEventHandler=INFO,state.change.logger=INFO"
+      KAFKA_AUTHORIZER_CLASS_NAME: kafka.security.authorizer.AclAuthorizer
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "true"
+    networks:
+      - kafka_network
+      - default
+
+  kafka_broker_1:
+    extends:
+      service: kafka_base
+    container_name: kafka_broker_1
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka_broker_1:19092,EXTERNAL://localhost:9092,DOCKER://host.docker.internal:29092
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9092,DOCKER://0.0.0.0:29092
+
+  kafka_broker_2:
+    extends:
+      service: kafka_base
+    container_name: kafka_broker_2
+    ports:
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka_broker_2:19093,EXTERNAL://localhost:9093,DOCKER://host.docker.internal:29093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:19093,EXTERNAL://0.0.0.0:9093,DOCKER://0.0.0.0:29093
+
+  kafka_broker_3:
+    extends:
+      service: kafka_base
+    container_name: kafka_broker_3
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka_broker_3:19094,EXTERNAL://localhost:9094,DOCKER://host.docker.internal:29094
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:19094,EXTERNAL://0.0.0.0:9094,DOCKER://0.0.0.0:29094
+
+  kafka_schema_registry:
+    image: confluentinc/cp-schema-registry:6.2.1
+    container_name: kafka_schema_registry
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "PLAINTEXT://kafka_broker_1:19092,PLAINTEXT://kafka_broker_2:19093,PLAINTEXT://kafka_broker_3:19094"
+      SCHEMA_REGISTRY_HOST_NAME: kafka_schema_registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    networks:
+      - kafka_network
+      - default
+
+  kafka_connect:
+    image: confluentinc/cp-kafka-connect:6.2.1
+    container_name: kafka_connect
+    ports:
+      - "8083:8083"
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: "kafka_broker_1:19092,kafka_broker_2:19093,kafka_broker_3:19094"
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: "connect-cluster"
+      CONNECT_CONFIG_STORAGE_TOPIC: "_connect-configs"
+      CONNECT_OFFSET_STORAGE_TOPIC: "_connect-offsets"
+      CONNECT_STATUS_STORAGE_TOPIC: "_connect-status"
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 3
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 3
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 3
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_INTERNAL_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_INTERNAL_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka_connect
+      CONNECT_LOG4J_ROOT_LOGLEVEL: INFO
+      CONNECT_PLUGIN_PATH: /usr/share/java
+    networks:
+      - kafka_network
+      - default
+
+  kafka_ui:
+    container_name: kafka-ui-1
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8888:8080"
+    depends_on:
+      - kafka_broker_1
+      - kafka_broker_2
+      - kafka_broker_3
+      - kafka_schema_registry
+      - kafka_connect
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "kafka_broker_1:19092,kafka_broker_2:19093,kafka_broker_3:19094"
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://kafka_schema_registry:8081
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka_connect:8083
+      DYNAMIC_CONFIG_ENABLED: "true"
+    networks:
+      - kafka_network
+      - default
+
+  # ================= SPARK =================
+
+  spark_master:
+    image: apache/spark:3.5.0
+    container_name: spark_master
+    hostname: spark-master
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.master.Master
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_MASTER_HOST: "spark-master"
+    ports:
+      - "8085:8080"   # Spark UI
+      - "7077:7077"   # Spark master port
+    volumes:
+      - ./:/home
+      - spark_data:/opt/spark/data
+    networks:
+      default:
+        aliases:
+          - spark-master
+      kafka_network:
+        aliases:
+          - spark-master
+
+  spark_worker:
+    image: apache/spark:3.5.0
+    container_name: spark_worker
+    hostname: spark-worker
+    depends_on:
+      - spark_master
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "2g"
+    volumes:
+      - ./:/home
+      - spark_data:/opt/spark/data
+    networks:
+      default:
+        aliases:
+          - spark-worker
+
+# ================= VOLUMES =================
+volumes:
+  airflow_db_data:
+  spark_data:
+
+# ================= NETWORKS =================
+networks:
+  kafka_network:
+    driver: bridge
+  default:
+    external:
+      name: docker_streaming
