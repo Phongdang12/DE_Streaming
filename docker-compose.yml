@@ -264,6 +264,8 @@ services:
     environment:
       SPARK_NO_DAEMONIZE: "true"
       SPARK_MASTER_HOST: "spark-master"
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
     ports:
       - "8085:8080"   # Spark UI
       - "7077:7077"   # Spark master port
@@ -292,6 +294,8 @@ services:
       SPARK_NO_DAEMONIZE: "true"
       SPARK_WORKER_CORES: "2"
       SPARK_WORKER_MEMORY: "2g"
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
     volumes:
       - ./:/home
       - spark_data:/opt/spark/data
